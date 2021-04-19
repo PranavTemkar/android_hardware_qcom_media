@@ -46,6 +46,7 @@
 #define ALIGN4K 4096
 #define ALIGN2K 2048
 #define ALIGN128 128
+#define ALIGN64 64
 #define ALIGN32 32
 #define ALIGN16 16
 
@@ -55,7 +56,7 @@ namespace android {
 class C2DColorConverter : public C2DColorConverterBase {
 
 public:
-    C2DColorConverter(size_t srcWidth, size_t srcHeight, size_t dstWidth, size_t dstHeight, ColorConvertFormat srcFormat, ColorConvertFormat dstFormat, int32_t flags,size_t srcStride);
+    C2DColorConverter(size_t srcWidth, size_t srcHeight, size_t dstWidth, size_t dstHeight, ColorConvertFormat srcFormat, ColorConvertFormat dstFormat, int32_t flags, size_t srcStride, bool secure=false);
     int32_t getBuffReq(int32_t port, C2DBuffReq *req);
     int32_t dumpOutput(char * filename, char mode);
 protected:
@@ -78,6 +79,8 @@ private:
     C2DBytesPerPixel calcBytesPerPixel(ColorConvertFormat format);
 
     void *mC2DLibHandle;
+    LINK_c2dDriverInit mC2DDriveInit;
+    LINK_c2dDriverDeInit mC2DDriveDeInit;
     LINK_c2dCreateSurface mC2DCreateSurface;
     LINK_c2dUpdateSurface mC2DUpdateSurface;
     LINK_c2dReadSurface mC2DReadSurface;
@@ -109,13 +112,15 @@ private:
     enum ColorConvertFormat mSrcFormat;
     enum ColorConvertFormat mDstFormat;
     int32_t mFlags;
+    bool mSecure;
 
     int mError;
 };
 
-C2DColorConverter::C2DColorConverter(size_t srcWidth, size_t srcHeight, size_t dstWidth, size_t dstHeight, ColorConvertFormat srcFormat, ColorConvertFormat dstFormat, int32_t flags, size_t srcStride)
+C2DColorConverter::C2DColorConverter(size_t srcWidth, size_t srcHeight, size_t dstWidth, size_t dstHeight, ColorConvertFormat srcFormat, ColorConvertFormat dstFormat, int32_t flags, size_t srcStride, bool secure)
     : mC2DLibHandle(NULL),
-      mAdrenoUtilsHandle(NULL)
+      mAdrenoUtilsHandle(NULL),
+      mSecure(secure)
 {
      mError = 0;
      if (NV12_UBWC == dstFormat) {
@@ -129,6 +134,8 @@ C2DColorConverter::C2DColorConverter(size_t srcWidth, size_t srcHeight, size_t d
          mError = -1;
          return;
      }
+     mC2DDriveInit = (LINK_c2dDriverInit)dlsym(mC2DLibHandle, "c2dDriverInit");
+     mC2DDriveDeInit = (LINK_c2dDriverDeInit)dlsym(mC2DLibHandle, "c2dDriverDeInit");
      mC2DCreateSurface = (LINK_c2dCreateSurface)dlsym(mC2DLibHandle, "c2dCreateSurface");
      mC2DUpdateSurface = (LINK_c2dUpdateSurface)dlsym(mC2DLibHandle, "c2dUpdateSurface");
      mC2DReadSurface = (LINK_c2dReadSurface)dlsym(mC2DLibHandle, "c2dReadSurface");
@@ -137,16 +144,36 @@ C2DColorConverter::C2DColorConverter(size_t srcWidth, size_t srcHeight, size_t d
      mC2DFinish = (LINK_c2dFinish)dlsym(mC2DLibHandle, "c2dFinish");
      mC2DWaitTimestamp = (LINK_c2dWaitTimestamp)dlsym(mC2DLibHandle, "c2dWaitTimestamp");
      mC2DDestroySurface = (LINK_c2dDestroySurface)dlsym(mC2DLibHandle, "c2dDestroySurface");
-     mC2DMapAddr = (LINK_c2dMapAddr)dlsym(mC2DLibHandle, "c2dMapAddr");
+#ifdef SUPPORT_SECURE_C2D
+    if (mSecure)
+        mC2DMapAddr = (LINK_c2dMapAddr)dlsym(mC2DLibHandle, "c2dMapAddrProtected");
+    else
+#endif
+        mC2DMapAddr = (LINK_c2dMapAddr)dlsym(mC2DLibHandle, "c2dMapAddr");
      mC2DUnMapAddr = (LINK_c2dUnMapAddr)dlsym(mC2DLibHandle, "c2dUnMapAddr");
 
-     if (!mC2DCreateSurface || !mC2DUpdateSurface || !mC2DReadSurface
+     if (!mC2DDriveInit || !mC2DDriveDeInit
+        || !mC2DCreateSurface || !mC2DUpdateSurface || !mC2DReadSurface
         || !mC2DDraw || !mC2DFlush || !mC2DFinish || !mC2DWaitTimestamp
         || !mC2DDestroySurface || !mC2DMapAddr || !mC2DUnMapAddr) {
          ALOGE("%s: dlsym ERROR", __FUNCTION__);
          mError = -1;
          return;
      }
+
+#ifdef SUPPORT_SECURE_C2D
+    C2D_DRIVER_SETUP_INFO c2d_setup_info;
+    memset(&c2d_setup_info, 0, sizeof(c2d_setup_info));
+    if (secure) {
+        c2d_setup_info.config_mask = C2D_DRIVER_CONFIG_SECURE_CONTEXT;
+    }
+    mError = mC2DDriveInit(&c2d_setup_info);
+    if (C2D_STATUS_OK != mError) {
+        ALOGE("failed to C2DDriveInit, mError = %d\n", mError);
+        mError = -1;
+        return;
+    }
+#endif
 
      mAdrenoUtilsHandle = dlopen("libadreno_utils.so", RTLD_NOW);
      if (!mAdrenoUtilsHandle) {
@@ -161,6 +188,8 @@ C2DColorConverter::C2DColorConverter(size_t srcWidth, size_t srcHeight, size_t d
          mError = -1;
          return;
      }
+
+    ALOGV("%s: mSecure = %d", __FUNCTION__, mSecure);
 
     mSrcWidth = srcWidth;
     mSrcHeight = srcHeight;
@@ -213,6 +242,10 @@ C2DColorConverter::~C2DColorConverter()
         }
         mSrcSurfaceDef = NULL;
         mDstSurfaceDef = NULL;
+
+#ifdef SUPPORT_SECURE_C2D
+        mC2DDriveDeInit();
+#endif
     }
 
     if (mC2DLibHandle) {
@@ -306,6 +339,7 @@ bool C2DColorConverter::isYUVSurface(ColorConvertFormat format)
         case NV12_2K:
         case NV12_128m:
         case NV12_UBWC:
+        case CbYCrY:
             return true;
         case RGB565:
         case RGBA8888:
@@ -361,6 +395,13 @@ void* C2DColorConverter::getDummySurfaceDef(ColorConvertFormat format, size_t wi
 
 C2D_STATUS C2DColorConverter::updateYUVSurfaceDef(uint8_t *gpuAddr, void *base, void *data, bool isSource)
 {
+    C2D_SURFACE_TYPE isurface_type = (C2D_SURFACE_TYPE)(C2D_SURFACE_YUV_HOST | C2D_SURFACE_WITH_PHYS);
+#ifdef SUPPORT_SECURE_C2D
+    if (mSecure) {
+        isurface_type = (C2D_SURFACE_TYPE)(isurface_type | C2D_SURFACE_PROTECTED);
+    }
+#endif
+
     if (isSource) {
         C2D_YUV_SURFACE_DEF * srcSurfaceDef = (C2D_YUV_SURFACE_DEF *)mSrcSurfaceDef;
         srcSurfaceDef->plane0 = data;
@@ -373,7 +414,7 @@ C2D_STATUS C2DColorConverter::updateYUVSurfaceDef(uint8_t *gpuAddr, void *base, 
             srcSurfaceDef->phys2  = (uint8_t *)srcSurfaceDef->phys1 + mSrcYSize/4;
         }
         return mC2DUpdateSurface(mSrcSurface, C2D_SOURCE,
-                        (C2D_SURFACE_TYPE)(C2D_SURFACE_YUV_HOST | C2D_SURFACE_WITH_PHYS),
+                        isurface_type,
                         &(*srcSurfaceDef));
     } else {
         C2D_YUV_SURFACE_DEF * dstSurfaceDef = (C2D_YUV_SURFACE_DEF *)mDstSurfaceDef;
@@ -388,19 +429,26 @@ C2D_STATUS C2DColorConverter::updateYUVSurfaceDef(uint8_t *gpuAddr, void *base, 
         }
 
         return mC2DUpdateSurface(mDstSurface, C2D_TARGET,
-                        (C2D_SURFACE_TYPE)(C2D_SURFACE_YUV_HOST | C2D_SURFACE_WITH_PHYS),
+                        isurface_type,
                         &(*dstSurfaceDef));
     }
 }
 
 C2D_STATUS C2DColorConverter::updateRGBSurfaceDef(uint8_t *gpuAddr, void * data, bool isSource)
 {
+    C2D_SURFACE_TYPE isurface_type = (C2D_SURFACE_TYPE)(C2D_SURFACE_RGB_HOST | C2D_SURFACE_WITH_PHYS);
+#ifdef SUPPORT_SECURE_C2D
+    if (mSecure) {
+        isurface_type = (C2D_SURFACE_TYPE)(isurface_type | C2D_SURFACE_PROTECTED);
+    }
+#endif
+
     if (isSource) {
         C2D_RGB_SURFACE_DEF * srcSurfaceDef = (C2D_RGB_SURFACE_DEF *)mSrcSurfaceDef;
         srcSurfaceDef->buffer = data;
         srcSurfaceDef->phys = gpuAddr;
         return  mC2DUpdateSurface(mSrcSurface, C2D_SOURCE,
-                        (C2D_SURFACE_TYPE)(C2D_SURFACE_RGB_HOST | C2D_SURFACE_WITH_PHYS),
+                        isurface_type,
                         &(*srcSurfaceDef));
     } else {
         C2D_RGB_SURFACE_DEF * dstSurfaceDef = (C2D_RGB_SURFACE_DEF *)mDstSurfaceDef;
@@ -408,7 +456,7 @@ C2D_STATUS C2DColorConverter::updateRGBSurfaceDef(uint8_t *gpuAddr, void * data,
         ALOGV("dstSurfaceDef->buffer = %p\n", data);
         dstSurfaceDef->phys = gpuAddr;
         return mC2DUpdateSurface(mDstSurface, C2D_TARGET,
-                        (C2D_SURFACE_TYPE)(C2D_SURFACE_RGB_HOST | C2D_SURFACE_WITH_PHYS),
+                        isurface_type,
                         &(*dstSurfaceDef));
     }
 }
@@ -432,6 +480,8 @@ uint32_t C2DColorConverter::getC2DFormat(ColorConvertFormat format)
             return C2D_COLOR_FORMAT_420_YV12;
         case NV12_UBWC:
             return C2D_COLOR_FORMAT_420_NV12 | C2D_FORMAT_UBWC_COMPRESSED;
+        case CbYCrY:
+            return C2D_COLOR_FORMAT_422_UYVY;
         default:
             ALOGE("Format not supported , %d\n", format);
             return -1;
@@ -462,6 +512,8 @@ size_t C2DColorConverter::calcStride(ColorConvertFormat format, size_t width)
             return ALIGN(width, ALIGN16);
         case NV12_UBWC:
             return VENUS_Y_STRIDE(COLOR_FMT_NV12_UBWC, width);
+        case CbYCrY:
+            return ALIGN(width*2, ALIGN64);
         default:
             return 0;
     }
@@ -511,7 +563,6 @@ size_t C2DColorConverter::calcSize(ColorConvertFormat format, size_t width, size
             mAdrenoComputeAlignedWidthAndHeight(width, height, bpp, tile_mode, raster_mode, padding_threshold,
                                                 &alignedw, &alignedh);
             size = alignedw * alignedh * bpp;
-            size = ALIGN(size, ALIGN4K);
             break;
         case RGBA8888:
             bpp = 4;
@@ -521,7 +572,6 @@ size_t C2DColorConverter::calcSize(ColorConvertFormat format, size_t width, size
               size = mSrcStride *  alignedh * bpp;
             else
               size = alignedw * alignedh * bpp;
-            size = ALIGN(size, ALIGN4K);
             break;
         case YCbCr420SP:
             alignedw = ALIGN(width, ALIGN16);
@@ -555,6 +605,10 @@ size_t C2DColorConverter::calcSize(ColorConvertFormat format, size_t width, size
             break;
         case NV12_UBWC:
             size = VENUS_BUFFER_SIZE(COLOR_FMT_NV12_UBWC, width, height);
+            break;
+        case CbYCrY:
+            size = ALIGN(ALIGN(width * 2, ALIGN64) * height, ALIGN4K);
+            break;
         default:
             break;
     }
@@ -778,10 +832,17 @@ int32_t C2DColorConverter::dumpOutput(char * filename, char mode) {
     return ret < 0 ? ret : 0;
 }
 
+#ifdef SUPPORT_SECURE_C2D
+extern "C" C2DColorConverterBase* createC2DColorConverter(size_t srcWidth, size_t srcHeight, size_t dstWidth, size_t dstHeight, ColorConvertFormat srcFormat, ColorConvertFormat dstFormat, int32_t flags, size_t srcStride, bool secure)
+{
+    return new C2DColorConverter(srcWidth, srcHeight, dstWidth, dstHeight, srcFormat, dstFormat, flags, srcStride, secure);
+}
+#else
 extern "C" C2DColorConverterBase* createC2DColorConverter(size_t srcWidth, size_t srcHeight, size_t dstWidth, size_t dstHeight, ColorConvertFormat srcFormat, ColorConvertFormat dstFormat, int32_t flags, size_t srcStride)
 {
     return new C2DColorConverter(srcWidth, srcHeight, dstWidth, dstHeight, srcFormat, dstFormat, flags, srcStride);
 }
+#endif
 
 extern "C" void destroyC2DColorConverter(C2DColorConverterBase* C2DCC)
 {
